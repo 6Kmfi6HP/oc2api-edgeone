@@ -1,0 +1,31 @@
+{
+  "name": "oc2api-edgeone",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenCode Zen free-model alias gateway for EdgeOne Makers.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/6Kmfi6HP/oc2api-edgeone.git"
+  },
+  "bugs": {
+    "url": "https://github.com/6Kmfi6HP/oc2api-edgeone/issues"
+  },
+  "homepage": "https://oc2api-edgeone.edgeone.dev",
+  "keywords": [
+    "edgeone",
+    "opencode",
+    "openai-compatible",
+    "proxy"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "edgeone": "1.6.19"
+  }
+}
