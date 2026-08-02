@@ -79,6 +79,48 @@ function toPublicModelId(modelId) {
   return modelId.slice(0, -FREE_MODEL_SUFFIX.length);
 }
 
+/**
+ * Drops function tools that carry no resolvable name. OpenCode CLI and
+ * CLAUDE_CODE_SIMPLE=1 clients can serialize tools as `{ type: "function",
+ * function: {} }`; strict upstreams (OpenCode Zen Console) reject those with
+ * `tools[0].function: missing field "name"`. Non-function tools and function
+ * tools that keep a name (chat `function.name` or responses top-level `name`)
+ * are passed through untouched. Returns the original array when nothing was
+ * removed, so callers can detect whether the body actually changed.
+ */
+function sanitizeTools(tools) {
+  if (!Array.isArray(tools) || tools.length === 0) {
+    return tools;
+  }
+
+  let anyRemoved = false;
+  const result = [];
+  for (const tool of tools) {
+    if (
+      tool !== null
+      && typeof tool === "object"
+      && !Array.isArray(tool)
+      && tool.type === "function"
+    ) {
+      const fn =
+        tool.function != null && typeof tool.function === "object"
+          ? tool.function
+          : null;
+      const fnName =
+        fn !== null && typeof fn.name === "string" && fn.name.length > 0
+          ? fn.name
+          : tool.name;
+      if (typeof fnName !== "string" || fnName.length === 0) {
+        anyRemoved = true;
+        continue;
+      }
+    }
+    result.push(tool);
+  }
+
+  return anyRemoved ? result : tools;
+}
+
 async function mapRequestBody(request) {
   if (request.body === null) {
     return null;
@@ -92,11 +134,30 @@ async function mapRequestBody(request) {
       payload !== null
       && typeof payload === "object"
       && !Array.isArray(payload)
-      && typeof payload.model === "string"
-      && payload.model.length > 0
     ) {
-      payload.model = toUpstreamModelId(payload.model);
-      return JSON.stringify(payload);
+      let changed = false;
+
+      if (typeof payload.model === "string" && payload.model.length > 0) {
+        const mappedModel = toUpstreamModelId(payload.model);
+        if (mappedModel !== payload.model) {
+          payload.model = mappedModel;
+          changed = true;
+        }
+      }
+
+      const cleanedTools = sanitizeTools(payload.tools);
+      if (cleanedTools !== payload.tools) {
+        if (cleanedTools.length === 0) {
+          delete payload.tools;
+        } else {
+          payload.tools = cleanedTools;
+        }
+        changed = true;
+      }
+
+      if (changed) {
+        return JSON.stringify(payload);
+      }
     }
   } catch {
     // Let the upstream return its native error for malformed JSON.
@@ -205,6 +266,7 @@ export {
   forwardHeaders,
   mapRequestBody,
   requestInit,
+  sanitizeTools,
   toPublicModelId,
   toUpstreamModelId,
   upstreamUrl,

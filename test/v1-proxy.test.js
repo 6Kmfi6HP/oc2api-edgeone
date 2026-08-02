@@ -6,6 +6,7 @@ import onRequest, {
   PUBLIC_AUTHORIZATION,
   filterModelsResponse,
   requestInit,
+  sanitizeTools,
   toPublicModelId,
   toUpstreamModelId,
   upstreamUrl,
@@ -184,6 +185,55 @@ test("does not add the free suffix twice", async () => {
 
   const init = await requestInit(request);
 
+  assert.deepEqual(JSON.parse(init.body), {
+    model: "mimo-v2.5-free",
+    messages: [],
+  });
+});
+
+test("drops nameless function tools before forwarding to the upstream", async () => {
+  const tools = [
+    { type: "function", function: {} },
+    { type: "function", name: "top-level-name", function: {} },
+    { type: "function", function: { name: "bash", description: "run shells" } },
+    { type: "custom", value: 1 },
+  ];
+
+  assert.deepEqual(sanitizeTools(tools), [
+    { type: "function", name: "top-level-name", function: {} },
+    { type: "function", function: { name: "bash", description: "run shells" } },
+    { type: "custom", value: 1 },
+  ]);
+
+  const request = contextFor("/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "mimo-v2.5", tools }),
+  }).request;
+
+  const init = await requestInit(request);
+  assert.deepEqual(JSON.parse(init.body), {
+    model: "mimo-v2.5-free",
+    tools: [
+      { type: "function", name: "top-level-name", function: {} },
+      { type: "function", function: { name: "bash", description: "run shells" } },
+      { type: "custom", value: 1 },
+    ],
+  });
+});
+
+test("deletes the tools field when every function tool is nameless", async () => {
+  const request = contextFor("/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "mimo-v2.5",
+      messages: [],
+      tools: [{ type: "function", function: {} }],
+    }),
+  }).request;
+
+  const init = await requestInit(request);
   assert.deepEqual(JSON.parse(init.body), {
     model: "mimo-v2.5-free",
     messages: [],

@@ -10,7 +10,8 @@
 
 - `GET /v1/models` 过滤掉非免费模型，并将 `deepseek-v4-flash-free` 显示为 `deepseek-v4-flash`。
 - `/v1/responses`、`/v1/chat/completions` 和 `/v1/messages` 将 JSON 请求体顶层的 `model` 映射回上游 `*-free` ID。
-- 除顶层 `model` 外，其他 JSON 字段保持不变；推理响应和 SSE 流不做解析或转换。
+- 除顶层 `model` 外，其他 JSON 字段保持不变；但会丢弃缺少可解析 `name` 的 function 工具（OpenCode CLI 与 `CLAUDE_CODE_SIMPLE=1` 客户端会把工具序列化为 `{"type":"function","function":{}}`，上游 Console 会以 `tools[0].function: missing field "name"` 拒绝）。若清理后 `tools` 为空数组，则删除该字段。
+- 推理响应和 SSE 流不做解析或转换。
 - 上游固定使用 OpenCode 的公开免费 Key `Bearer public`。客户端无需提供 API Key，客户端传入的 `Authorization` 或 `x-api-key` 不会转发。
 
 当前 OpenCode Zen 将免费模型列为 OpenAI-compatible Chat Completions 模型。`/v1/responses` 和 `/v1/messages` 会完成模型 ID 映射，但不做协议转换；如果上游模型不支持相应协议，Zen 的错误响应会原样返回。
@@ -76,7 +77,7 @@ EdgeOne CLI 默认监听 `http://localhost:8088`。本地调试环境不能通�
 登录并绑定 EdgeOne Makers 项目后运行：
 
 ```bash
-npm exec edgeone makers deploy --area overseas --env production
+npm exec -- edgeone makers deploy -a overseas -e production
 ```
 
 项目锁定使用 `edgeone@1.6.19`，仓库不包含账号 Token、`.env` 或本地 `.edgeone` 项目绑定。
