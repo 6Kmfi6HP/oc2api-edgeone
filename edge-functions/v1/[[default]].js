@@ -2,6 +2,7 @@ const UPSTREAM_ORIGIN = "https://opencode.ai";
 const UPSTREAM_PREFIX = "/zen";
 const PUBLIC_AUTHORIZATION = "Bearer public";
 const FREE_MODEL_SUFFIX = "-free";
+const DEFAULT_MODEL = "deepseek-v4-flash";
 const MAX_TIMEOUT_MS = 300_000;
 
 const MODEL_LIST_PATH = "/v1/models";
@@ -122,6 +123,25 @@ function jsonResponseBody(status, payload) {
     status,
     headers,
   });
+}
+
+/**
+ * Reads a request body and parses it as a top-level JSON object.
+ * Returns `null` (no throw) for empty, malformed, or non-object bodies so
+ * callers can reply with their protocol-specific 400. Used by the message and
+ * responses handlers to avoid duplicating the parse + type-check dance.
+ */
+async function readJsonObject(request) {
+  let payload;
+  try {
+    payload = JSON.parse(await request.text());
+  } catch {
+    return null;
+  }
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return null;
+  }
+  return payload;
 }
 
 function sseResponse(stream) {
@@ -460,7 +480,10 @@ function ensureReasoningContent(messages, thinking) {
   }
   const result = messages.slice();
   for (let i = 0; i < result.length; i++) {
-    if (result[i].role === "assistant" && result[i].reasoning_content === undefined) {
+    // `== null` covers both an absent field and an explicit `null`, which the
+    // serializer would otherwise drop and the upstream thinking-mode check
+    // would reject (mirrors the Go `*string` nil-vs-empty distinction).
+    if (result[i].role === "assistant" && result[i].reasoning_content == null) {
       result[i] = { ...result[i], reasoning_content: "" };
     }
   }
@@ -2385,18 +2408,18 @@ function responsesStreamHandler(respBody, model, wantReasoning, tools, toolChoic
 // ======================== HTTP 入口 ========================
 
 async function handleMessages(request) {
-  let body;
-  try {
-    body = JSON.parse(await request.text());
-  } catch {
-    return jsonResponseBody(400, { type: "error", error: { type: "invalid_request_error", message: "Invalid JSON" } });
-  }
-  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+  const body = await readJsonObject(request);
+  if (body === null) {
     return jsonResponseBody(400, { type: "error", error: { type: "invalid_request_error", message: "Invalid JSON" } });
   }
 
+  const model =
+    typeof body.model === "string" && body.model.length > 0
+      ? body.model
+      : DEFAULT_MODEL;
+
   const req = {
-    model: toUpstreamModelId(body.model),
+    model: toUpstreamModelId(model),
     messages: Array.isArray(body.messages) ? body.messages : [],
     system: body.system,
     max_tokens: body.max_tokens,
@@ -2452,18 +2475,13 @@ function publicModelFromUpstream(upstreamModel) {
 }
 
 async function handleResponses(request) {
-  let req;
-  try {
-    req = JSON.parse(await request.text());
-  } catch {
-    return jsonResponseBody(400, { error: { message: "Invalid JSON" } });
-  }
-  if (req === null || typeof req !== "object" || Array.isArray(req)) {
+  const req = await readJsonObject(request);
+  if (req === null) {
     return jsonResponseBody(400, { error: { message: "Invalid JSON" } });
   }
 
   const originalReq = req;
-  const model = typeof req.model === "string" && req.model !== "" ? req.model : "deepseek-v4-flash";
+  const model = typeof req.model === "string" && req.model !== "" ? req.model : DEFAULT_MODEL;
   const upstreamModel = toUpstreamModelId(model);
 
   const messages = Array.isArray(req.messages) ? req.messages.slice() : [];
@@ -2582,7 +2600,17 @@ export default async function onRequest(context) {
     // 无需格式转换，保持透传以支持原生流式而不过早消费上游 body）
     const response = await fetch(upstreamUrl(request.url), await requestInit(request));
     return response;
-  } catch {
+  } catch (err) {
+    // 任何未预期异常都收敛为通用 502；先落一条日志，否则线上失败完全不可查。
+    try {
+      const method = request?.method ?? "?";
+      const url = request?.url ?? "?";
+      console.error(
+        `[oc2api] unhandled error ${method} ${url}: ${err?.message ?? String(err)}`,
+      );
+    } catch {
+      // Logging must never take the request down.
+    }
     return new Response("Bad Gateway", {
       status: 502,
       headers: {
@@ -2624,6 +2652,32 @@ async function mapRequestBody(request) {
           payload.tools = cleanedTools;
         }
         changed = true;
+      }
+
+      // Chat requests are passed through, so they never hit ensureReasoningContent
+      // in the messages/responses handlers. Upstream rejects multi-turn histories
+      // whose assistant messages carry no reasoning_content, so backfill empty
+      // strings here (same nil-vs-empty rule), unless thinking is explicitly off.
+      if (
+        Array.isArray(payload.messages)
+        && wantsReasoning({ thinking: payload.thinking, extra_body: payload.extra_body })
+      ) {
+        let backfilled = false;
+        for (const msg of payload.messages) {
+          if (
+            msg !== null
+            && typeof msg === "object"
+            && !Array.isArray(msg)
+            && msg.role === "assistant"
+            && msg.reasoning_content == null
+          ) {
+            msg.reasoning_content = "";
+            backfilled = true;
+          }
+        }
+        if (backfilled) {
+          changed = true;
+        }
       }
 
       if (changed) {
@@ -2704,6 +2758,7 @@ async function filterModelsResponse(response) {
 }
 
 export {
+  DEFAULT_MODEL,
   FREE_MODEL_SUFFIX,
   HOP_BY_HOP_HEADERS,
   MAX_TIMEOUT_MS,
@@ -2742,6 +2797,7 @@ export {
   normalizeFinishReason,
   openAIToClaudeResponse,
   parseJSONString,
+  readJsonObject,
   requestInit,
   responsesContentToMessageContent,
   responsesInputToMessages,

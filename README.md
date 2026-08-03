@@ -14,11 +14,27 @@
 
 三个推理接口统一内部转为 Chat Completions 协议转发上游，再把响应转回各自的协议：
 
-- `/v1/chat/completions`：天生就是 Chat 协议，请求仅做模型映射与工具清理，响应（含 SSE 流）直接透传，不做额外改写。
+- `/v1/chat/completions`：天生就是 Chat 协议，请求仅做模型映射、工具清理与 reasoning 兜底，响应（含 SSE 流）直接透传，不做额外改写。
 - `/v1/messages`（Claude）：请求把 `system`、`thinking`、`tool_use`、`tool_result`、`image` 内容块转为 Chat 消息与工具；响应反向转回 Claude `message` 格式——文本、`thinking` 块和 `tool_use` 输出，SSE 流则重写为 `message_start` / `content_block_start` / `content_block_delta` / `message_stop` 事件。
 - `/v1/responses`（OpenAI Responses API）：请求把 `input`、`instructions`、`function_call_output`、内置 `apply_patch` / `shell` 工具等转为 Chat 消息；响应反向转回 Responses 的 `message` / `reasoning` / `function_call` 输出项，SSE 流重写为 `response.created` / `output_text.delta` / `function_call_arguments.delta` / `response.completed` 事件。
 
 转换时保持 `reasoning_content` 与 thinking 的对应（Claude 侧显示为 `thinking` 块，Responses 侧显示为 `reasoning` 摘要），并修复缺失的 `tool_result`（无响应的 tool call 会补占位消息）。上游的错误响应和 4xx/5xx 状态码原样返回，不参与改写。
+
+### Thinking 模式下 `reasoning_content` 兜底
+
+上游在 thinking 模式下要求历史中每条 assistant 消息都必须携带 `reasoning_content`，否则返回
+`[invalid_request_error] The reasoning_content in the thinking mode must be passed back to the API`。
+但 Claude Code、Cherry Studio 等多轮回传时往往只带回文本、丢掉了 thinking 块。网关对此做两层处理：
+
+1. **先还原真实推理内容**：Claude 路径把客户端回传的 `thinking` 内容块提取回 `reasoning_content`；Responses 路径把 `reasoning` 条目累积回对应的 assistant 消息。
+2. **再以空串兜底**：仍缺 `reasoning_content`（字段缺失或显式为 `null`）的 assistant 历史消息补成 `""`——上游会把"传了空推理"当作合法，只有字段整体缺失才拒绝。三条入口均已挂载：
+
+   - `/v1/messages` 与 `/v1/responses`：在请求转成 Chat 消息后调用 `ensureReasoningContent`。
+   - `/v1/chat/completions`：走透传不进转换器，故在 `mapRequestBody` 内做同样的兜底。
+
+   `thinking: { type: "disabled" }` 时跳过兜底，不做任何字段注入；返回给客户端的方向则由 `cleanStreamDelta` 负责，在不需要 reasoning 时把 `reasoning_content`（含空串）从流中清理掉。
+
+   注：上游为 OpenAI 兼容端点，网关不校验 Anthropic 原生 thinking 的 `signature`。若将来直连 Anthropic 官方端点，空串兜底会失效（官方要求 `signature` 原样回传），届时应改为丢弃无签名的 thinking 块。
 
 ## 使用
 

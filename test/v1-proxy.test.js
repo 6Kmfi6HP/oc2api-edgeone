@@ -28,6 +28,7 @@ import onRequest, {
   forwardHeaders,
   isThinkingDisabled,
   isThinkingEnabled,
+  mapRequestBody,
   normalizeFinishReason,
   openAIToClaudeResponse,
   parseJSONString,
@@ -895,6 +896,29 @@ test("end-to-end Claude messages entry converts request and response", async () 
   assert.equal(clientBody.stop_reason, "end_turn");
 });
 
+test("end-to-end Claude messages entry defaults a missing model instead of 502", async () => {
+  let capturedBody;
+
+  const chatResponseBody = JSON.stringify({
+    id: "chatcmpl-default",
+    model: "deepseek-v4-flash-free",
+    choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop", index: 0 }],
+  });
+
+  const response = await withMockFetch(async (url, init) => {
+    capturedBody = JSON.parse(init.body);
+    return new Response(chatResponseBody, { headers: { "content-type": "application/json" } });
+  }, async () => onRequest(contextFor("/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+  })));
+
+  // A missing model must not explode into a 502 — it falls back to DEFAULT_MODEL.
+  assert.equal(response.status, 200);
+  assert.equal(capturedBody.model, "deepseek-v4-flash-free");
+});
+
 test("end-to-end Responses entry converts request and response", async () => {
   let capturedUrl;
   let capturedBody;
@@ -1072,4 +1096,70 @@ test("end-to-end preserves -free model mapping and tool sanitization", async () 
   // Nameless function tool removed, bash kept
   assert.equal(capturedBody.tools.length, 1);
   assert.equal(capturedBody.tools[0].name, "bash");
+});
+
+test("ensureReasoningContent backfills an explicit null the same as a missing field", () => {
+  const messages = [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: "hello", reasoning_content: null },
+    { role: "user", content: "again" },
+    { role: "assistant", content: "world" },
+  ];
+
+  const out = ensureReasoningContent(messages, true);
+
+  // Original array untouched; both assistant entries (missing AND null) get "".
+  assert.equal(messages[1].reasoning_content, null);
+  assert.equal(out[1].reasoning_content, "");
+  assert.equal(out[3].reasoning_content, "");
+
+  // Non-assistant messages are never touched.
+  assert.equal(Object.hasOwn(out[0], "reasoning_content"), false);
+
+  // Thinking disabled short-circuits: returns the original array untouched.
+  const disabled = ensureReasoningContent(messages, false);
+  assert.equal(disabled, messages);
+  assert.equal(disabled[1].reasoning_content, null);
+});
+
+test("mapRequestBody backfills reasoning_content on pass-through chat turns", async () => {
+  const request = new Request("https://proxy.example/v1/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "deepseek-v4-flash",
+      messages: [
+        { role: "user", content: "first" },
+        { role: "assistant", content: "answer" },
+        { role: "user", content: "second" },
+      ],
+    }),
+  });
+
+  const body = await mapRequestBody(request);
+  const payload = JSON.parse(body);
+
+  // Assistant history now carries an empty reasoning_content; user messages don't.
+  assert.equal(payload.messages[1].reasoning_content, "");
+  assert.equal(Object.hasOwn(payload.messages[0], "reasoning_content"), false);
+});
+
+test("mapRequestBody skips reasoning backfill when thinking is disabled", async () => {
+  const request = new Request("https://proxy.example/v1/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "deepseek-v4-flash",
+      thinking: { type: "disabled" },
+      messages: [
+        { role: "user", content: "first" },
+        { role: "assistant", content: "answer" },
+      ],
+    }),
+  });
+
+  const body = await mapRequestBody(request);
+  const payload = JSON.parse(body);
+
+  // Only the model mapping changed; no reasoning_content was injected.
+  assert.equal(payload.model, "deepseek-v4-flash-free");
+  assert.equal(Object.hasOwn(payload.messages[1], "reasoning_content"), false);
 });
