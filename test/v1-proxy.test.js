@@ -795,6 +795,82 @@ test("claudeStreamHandler aggregates thinking blocks when keepReasoning is true"
   assert.equal(textStarts.length, 1, "one text block start");
 });
 
+// Zen/Go #37635: streaming puts the visible reply in reasoning_content with empty content.
+test("claudeStreamHandler promotes reasoning_content to text when keepReasoning is false", async () => {
+  const upstreamSse = [
+    "data: " + JSON.stringify({ id: "chatcmpl-rc", choices: [{ delta: { role: "assistant", reasoning_content: "Hello" }, finish_reason: null, index: 0 }] }) + "\n\n",
+    "data: " + JSON.stringify({ choices: [{ delta: { reasoning_content: " world" }, finish_reason: null, index: 0 }] }) + "\n\n",
+    "data: " + JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop", index: 0 }] }) + "\n\n",
+    "data: [DONE]\n\n",
+  ].join("");
+
+  const events = await collectSSEEvents(claudeStreamHandler(
+    new Response(upstreamSse).body,
+    "deepseek-v4-flash",
+    false,
+  ));
+
+  const thinkingStarts = events.filter(e => e.event === "content_block_start" && e.data.content_block?.type === "thinking");
+  assert.equal(thinkingStarts.length, 0, "no thinking blocks when keepReasoning is false");
+
+  const textDeltas = events.filter(e => e.event === "content_block_delta" && e.data.delta?.type === "text_delta");
+  assert.deepEqual(textDeltas.map(e => e.data.delta.text), ["Hello", " world"]);
+});
+
+test("claudeStreamHandler flushes reasoning as text when keepReasoning and content never arrives", async () => {
+  const upstreamSse = [
+    "data: " + JSON.stringify({ id: "chatcmpl-rc2", choices: [{ delta: { reasoning_content: "Only reasoning reply" }, finish_reason: null, index: 0 }] }) + "\n\n",
+    "data: " + JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop", index: 0 }] }) + "\n\n",
+    "data: [DONE]\n\n",
+  ].join("");
+
+  const events = await collectSSEEvents(claudeStreamHandler(
+    new Response(upstreamSse).body,
+    "deepseek-v4-flash",
+    true,
+  ));
+
+  const thinkingDeltas = events.filter(e => e.event === "content_block_delta" && e.data.delta?.type === "thinking_delta");
+  assert.equal(thinkingDeltas.length, 1);
+
+  const textDeltas = events.filter(e => e.event === "content_block_delta" && e.data.delta?.type === "text_delta");
+  assert.deepEqual(textDeltas.map(e => e.data.delta.text), ["Only reasoning reply"]);
+});
+
+test("openAIToClaudeResponse promotes reasoning_content when content is empty", () => {
+  const chatBody = JSON.stringify({
+    id: "chatcmpl-empty",
+    choices: [{
+      index: 0,
+      message: { role: "assistant", content: "", reasoning_content: "Visible answer" },
+      finish_reason: "stop",
+    }],
+  });
+
+  const disabled = JSON.parse(openAIToClaudeResponse(chatBody, "deepseek-v4-flash", false));
+  assert.deepEqual(disabled.content, [{ type: "text", text: "Visible answer" }]);
+
+  const enabled = JSON.parse(openAIToClaudeResponse(chatBody, "deepseek-v4-flash", true));
+  assert.deepEqual(enabled.content, [
+    { type: "thinking", thinking: "Visible answer" },
+    { type: "text", text: "Visible answer" },
+  ]);
+});
+
+test("convertStreamChunkWithUsage promotes reasoning into content when keepReasoning is false", () => {
+  const [out] = convertStreamChunkWithUsage(
+    "data: " + JSON.stringify({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      choices: [{ index: 0, delta: { reasoning_content: "hi" }, finish_reason: null }],
+    }),
+    false,
+  );
+  const chunk = JSON.parse(out.slice(6));
+  assert.equal(chunk.choices[0].delta.content, "hi");
+  assert.equal(Object.hasOwn(chunk.choices[0].delta, "reasoning_content"), false);
+});
+
 test("responsesStreamHandler parses Chat SSE and emits Responses events", async () => {
   const upstreamSse = [
     "data: " + JSON.stringify({ id: "chatcmpl-1", created: 1234567890, usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 }, choices: [{ delta: { content: "Hello" }, finish_reason: null, index: 0 }] }) + "\n\n",

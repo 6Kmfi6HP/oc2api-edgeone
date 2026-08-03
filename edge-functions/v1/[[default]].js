@@ -297,7 +297,27 @@ function cleanNulls(map) {
   }
 }
 
+/**
+ * Zen/Go streaming sometimes puts the visible reply in `reasoning_content`
+ * with empty `content` (anomalyco/opencode#37635). When the client is not
+ * keeping reasoning, move that text into `content` so converters still emit
+ * a non-empty assistant reply instead of an empty /v1/messages turn.
+ */
+function promoteReasoningToContent(fields, keepReasoning) {
+  if (keepReasoning || fields === null || typeof fields !== "object" || Array.isArray(fields)) {
+    return;
+  }
+  const contentEmpty = fields.content == null || fields.content === "";
+  const reasoning = fields.reasoning_content;
+  if (!contentEmpty || typeof reasoning !== "string" || reasoning === "") {
+    return;
+  }
+  fields.content = reasoning;
+  delete fields.reasoning_content;
+}
+
 function cleanStreamDelta(delta, keepReasoning) {
+  promoteReasoningToContent(delta, keepReasoning);
   if (Object.prototype.hasOwnProperty.call(delta, "content") && delta.content === null) {
     delete delta.content;
   }
@@ -361,6 +381,7 @@ function convertStreamChunkWithUsage(line, keepReasoning) {
     }
     if (choice.message != null && typeof choice.message === "object") {
       const msg = choice.message;
+      promoteReasoningToContent(msg, keepReasoning);
       cleanNulls(msg);
       if (!keepReasoning) {
         delete msg.reasoning_content;
@@ -405,6 +426,7 @@ function convertResponse(data, keepReasoning) {
       }
       if (choice.message != null && typeof choice.message === "object") {
         const msg = choice.message;
+        promoteReasoningToContent(msg, keepReasoning);
         cleanNulls(msg);
         if (!keepReasoning) {
           delete msg.reasoning_content;
@@ -1262,12 +1284,19 @@ function openAIToClaudeResponse(chatBody, model, wantReasoning) {
     const choice = chat.choices[0] || {};
     const msg = choice.message || {};
     const fr = choice.finish_reason;
-
-    if (wantReasoning && typeof msg.reasoning_content === "string" && msg.reasoning_content !== "") {
-      content.push({ type: "thinking", thinking: msg.reasoning_content });
+    let text = typeof msg.content === "string" ? msg.content : "";
+    const reasoning = typeof msg.reasoning_content === "string" ? msg.reasoning_content : "";
+    const hasTools = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+    // #37635: empty content with reasoning-only reply → still emit visible text.
+    if (text === "" && reasoning !== "" && !hasTools) {
+      text = reasoning;
     }
-    if (typeof msg.content === "string" && msg.content !== "") {
-      content.push({ type: "text", text: msg.content });
+
+    if (wantReasoning && reasoning !== "") {
+      content.push({ type: "thinking", thinking: reasoning });
+    }
+    if (text !== "") {
+      content.push({ type: "text", text });
     }
     if (Array.isArray(msg.tool_calls)) {
       for (const tc of msg.tool_calls) {
@@ -1335,6 +1364,8 @@ function claudeStreamHandler(respBody, model, keepReasoning) {
       let fullUsage = null;
       let finalStopReason = "end_turn";
       let finishSeen = false;
+      let sawText = false;
+      let reasoningAcc = "";
 
       const emit = (event, data) => {
         controller.enqueue(enc.encode(`event: ${event}\n`));
@@ -1361,6 +1392,35 @@ function claudeStreamHandler(respBody, model, keepReasoning) {
           content_block: { type: "text" },
         });
         textBlockOpen = false;
+      };
+      const emitTextDelta = (contentStr) => {
+        if (contentStr === "") {
+          return;
+        }
+        closeThinkingBlock();
+        if (!textBlockOpen) {
+          emit("content_block_start", {
+            type: "content_block_start",
+            index: blockIndex,
+            content_block: { type: "text", text: "" },
+          });
+          textBlockOpen = true;
+          blockIndex++;
+        }
+        emit("content_block_delta", {
+          type: "content_block_delta",
+          index: blockIndex - 1,
+          delta: { type: "text_delta", text: contentStr },
+        });
+        sawText = true;
+      };
+      const flushReasoningAsTextIfNeeded = () => {
+        // keepReasoning path streamed thinking only (#37635) — still emit text
+        // so Claude clients that ignore thinking do not treat the turn as empty.
+        if (sawText || toolCallOrder.length > 0 || reasoningAcc === "") {
+          return;
+        }
+        emitTextDelta(reasoningAcc);
       };
 
       try {
@@ -1389,6 +1449,7 @@ function claudeStreamHandler(respBody, model, keepReasoning) {
           const choice = choices[0] || {};
           const delta = choice.delta || {};
           const finishReason = choice.finish_reason;
+          promoteReasoningToContent(delta, keepReasoning);
 
           if (!messageStartSent) {
             messageStartSent = true;
@@ -1410,6 +1471,7 @@ function claudeStreamHandler(respBody, model, keepReasoning) {
           if (delta.reasoning_content != null && keepReasoning) {
             const rcStr = typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
             if (rcStr !== "") {
+              reasoningAcc += rcStr;
               closeTextBlock();
               if (!thinkingBlockOpen) {
                 emit("content_block_start", {
@@ -1430,23 +1492,7 @@ function claudeStreamHandler(respBody, model, keepReasoning) {
 
           if (delta.content != null) {
             const contentStr = typeof delta.content === "string" ? delta.content : "";
-            if (contentStr !== "") {
-              closeThinkingBlock();
-              if (!textBlockOpen) {
-                emit("content_block_start", {
-                  type: "content_block_start",
-                  index: blockIndex,
-                  content_block: { type: "text", text: "" },
-                });
-                textBlockOpen = true;
-                blockIndex++;
-              }
-              emit("content_block_delta", {
-                type: "content_block_delta",
-                index: blockIndex - 1,
-                delta: { type: "text_delta", text: contentStr },
-              });
-            }
+            emitTextDelta(contentStr);
           }
 
           if (Array.isArray(delta.tool_calls)) {
@@ -1498,6 +1544,7 @@ function claudeStreamHandler(respBody, model, keepReasoning) {
               continue;
             }
             finishSeen = true;
+            flushReasoningAsTextIfNeeded();
             closeThinkingBlock();
             closeTextBlock();
 
@@ -1525,6 +1572,7 @@ function claudeStreamHandler(respBody, model, keepReasoning) {
           }
         }
 
+        flushReasoningAsTextIfNeeded();
         closeThinkingBlock();
         closeTextBlock();
         emit("message_delta", {
@@ -2103,15 +2151,28 @@ function convertChatToResponses(chatBody, model, wantReasoning, tools, toolChoic
 
   if (Array.isArray(chat.choices) && chat.choices.length > 0) {
     const choice = chat.choices[0] || {};
-    const msg = choice.message || {};
+    const msg = { ...(choice.message || {}) };
+    promoteReasoningToContent(msg, wantReasoning);
     messageContent = chatContentToResponsesContent(msg.content);
     if (typeof msg.refusal === "string" && msg.refusal !== "") {
       messageContent = [{ type: "refusal", refusal: msg.refusal }];
     }
+    const reasoningText = typeof msg.reasoning_content === "string" ? msg.reasoning_content : "";
     if (wantReasoning) {
-      reasoning = typeof msg.reasoning_content === "string" ? msg.reasoning_content : "";
+      reasoning = reasoningText;
     }
     toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+    // #37635: reasoning-only reply with keepReasoning still needs a visible message.
+    if (
+      (messageContent == null || messageContent.length === 0)
+      && toolCalls.length === 0
+      && reasoningText !== ""
+    ) {
+      messageContent = [{ type: "output_text", text: reasoningText }];
+      if (wantReasoning) {
+        reasoning = reasoningText;
+      }
+    }
     finishReason = choice.finish_reason;
   }
 
@@ -2488,6 +2549,7 @@ function responsesStreamHandler(respBody, model, wantReasoning, tools, toolChoic
           const choice = choices[0] || {};
           const delta = choice.delta || {};
           const finishReason = choice.finish_reason;
+          promoteReasoningToContent(delta, wantReasoning);
 
           if (delta.reasoning_content != null && wantReasoning) {
             const rcStr = typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
@@ -2630,6 +2692,10 @@ function responsesStreamHandler(respBody, model, wantReasoning, tools, toolChoic
             emitReasoningDone();
             if (!messageStarted && toolCalls.size === 0) {
               const idx = messageOutputIndex();
+              // #37635: reasoning-only upstream stream still needs a visible message item.
+              if (fullText === "" && fullReasoning !== "") {
+                fullText = fullReasoning;
+              }
               seq++;
               emit("response.output_item.added", {
                 type: "response.output_item.added",
@@ -2646,6 +2712,18 @@ function responsesStreamHandler(respBody, model, wantReasoning, tools, toolChoic
                 content_index: 0,
                 part: { type: "output_text", annotations: [], logprobs: [], text: "" },
               });
+              if (fullText !== "") {
+                seq++;
+                emit("response.output_text.delta", {
+                  type: "response.output_text.delta",
+                  sequence_number: seq,
+                  item_id: msgID,
+                  output_index: idx,
+                  content_index: 0,
+                  delta: fullText,
+                  logprobs: [],
+                });
+              }
               messageStarted = true;
             }
             emitMessageDone();
