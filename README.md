@@ -9,12 +9,16 @@
 ## 工作方式
 
 - `GET /v1/models` 过滤掉非免费模型，并将 `deepseek-v4-flash-free` 显示为 `deepseek-v4-flash`。
-- `/v1/responses`、`/v1/chat/completions` 和 `/v1/messages` 将 JSON 请求体顶层的 `model` 映射回上游 `*-free` ID。
-- 除顶层 `model` 外，其他 JSON 字段保持不变；但会丢弃缺少可解析 `name` 的 function 工具（OpenCode CLI 与 `CLAUDE_CODE_SIMPLE=1` 客户端会把工具序列化为 `{"type":"function","function":{}}`，上游 Console 会以 `tools[0].function: missing field "name"` 拒绝）。若清理后 `tools` 为空数组，则删除该字段。
-- 推理响应和 SSE 流不做解析或转换。
 - 上游固定使用 OpenCode 的公开免费 Key `Bearer public`。客户端无需提供 API Key，客户端传入的 `Authorization` 或 `x-api-key` 不会转发。
+- 所有请求都会把顶层 `model` 映射回上游 `*-free` ID，并丢弃缺少可解析 `name` 的 function 工具（OpenCode CLI 与 `CLAUDE_CODE_SIMPLE=1` 客户端会把工具序列化为 `{"type":"function","function":{}}`，上游 Console 会以 `tools[0].function: missing field "name"` 拒绝）。若清理后 `tools` 为空数组，则删除该字段。
 
-当前 OpenCode Zen 将免费模型列为 OpenAI-compatible Chat Completions 模型。`/v1/responses` 和 `/v1/messages` 会完成模型 ID 映射，但不做协议转换；如果上游模型不支持相应协议，Zen 的错误响应会原样返回。
+三个推理接口统一内部转为 Chat Completions 协议转发上游，再把响应转回各自的协议：
+
+- `/v1/chat/completions`：天生就是 Chat 协议，请求仅做模型映射与工具清理，响应（含 SSE 流）直接透传，不做额外改写。
+- `/v1/messages`（Claude）：请求把 `system`、`thinking`、`tool_use`、`tool_result`、`image` 内容块转为 Chat 消息与工具；响应反向转回 Claude `message` 格式——文本、`thinking` 块和 `tool_use` 输出，SSE 流则重写为 `message_start` / `content_block_start` / `content_block_delta` / `message_stop` 事件。
+- `/v1/responses`（OpenAI Responses API）：请求把 `input`、`instructions`、`function_call_output`、内置 `apply_patch` / `shell` 工具等转为 Chat 消息；响应反向转回 Responses 的 `message` / `reasoning` / `function_call` 输出项，SSE 流重写为 `response.created` / `output_text.delta` / `function_call_arguments.delta` / `response.completed` 事件。
+
+转换时保持 `reasoning_content` 与 thinking 的对应（Claude 侧显示为 `thinking` 块，Responses 侧显示为 `reasoning` 摘要），并修复缺失的 `tool_result`（无响应的 tool call 会补占位消息）。上游的错误响应和 4xx/5xx 状态码原样返回，不参与改写。
 
 ## 使用
 
@@ -87,7 +91,7 @@ npm exec -- edgeone makers deploy -a overseas -e production
 - Edge Function 客户端请求 body 上限为 1 MB。
 - 上游连接、读取和写入超时均设置为 300 秒。
 - 每个请求只发起一次上游 `fetch`；网络异常返回通用 `502 Bad Gateway`。
-- 模型列表响应和三种推理请求体需要在函数中读取，受 1 MB body 限制；推理响应仍直接流式返回。
+- 模型列表响应和三种推理请求体需要在函数中读取，受 1 MB body 限制。`/v1/chat/completions` 的响应流式透传；`/v1/messages` 与 `/v1/responses` 的响应（含 SSE 流）会被解析并重写为对应协议。
 - 除成功的模型列表响应外，上游 4xx、5xx、重定向、响应头和响应体不会被业务逻辑改写。
 
 该服务没有代理层限流或访问控制。公开部署前应根据流量和滥用风险增加相应保护。
