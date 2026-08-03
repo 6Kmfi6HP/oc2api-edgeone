@@ -10,10 +10,12 @@ import onRequest, {
   chatContentToResponsesContent,
   chatUpstreamUrl,
   cleanJsonSchema,
+  clearStoredResponses,
   claudeStreamHandler,
   claudeToOpenAIMessages,
   claudeToOpenAITools,
   collectFunctionOutputs,
+  convertAnthropicToOpenAI,
   convertChatToResponses,
   convertClaudeRequest,
   convertClaudeToolChoice,
@@ -26,8 +28,10 @@ import onRequest, {
   filterModelsResponse,
   fixToolCallGaps,
   forwardHeaders,
+  isAnthropicFormat,
   isThinkingDisabled,
   isThinkingEnabled,
+  loadResponseState,
   mapRequestBody,
   normalizeFinishReason,
   openAIToClaudeResponse,
@@ -41,6 +45,7 @@ import onRequest, {
   responsesToolKindMap,
   sanitizeTools,
   sseResponse,
+  storeResponseState,
   toFloat64,
   toolCallOutputType,
   toPublicModelId,
@@ -275,12 +280,13 @@ test("maps the top-level model for all three inference protocols", async () => {
     assert.ok(Array.isArray(clientBody.output), "Responses format has output array");
   }
 
-  // /v1/chat/completions: still passes through as-is (chat format upstream, chat format client)
+  // /v1/chat/completions: maps model and returns cleaned Chat JSON
   {
     let capturedInit;
     const chatResponseBody = JSON.stringify({
       id: "chatcmpl-3",
-      choices: [{ message: { role: "assistant", content: "yes" } }],
+      choices: [{ message: { role: "assistant", content: "yes" }, finish_reason: "stop", index: 0 }],
+      cost: 0.01,
     });
     const upstreamResponse = new Response(chatResponseBody, {
       status: 200,
@@ -302,7 +308,12 @@ test("maps the top-level model for all three inference protocols", async () => {
       }),
     })));
 
-    assert.equal(response, upstreamResponse, "chat/completions passes through unchanged");
+    const upstreamBody = JSON.parse(capturedInit.body);
+    assert.equal(upstreamBody.model, "deepseek-v4-flash-free");
+    const clientBody = await response.json();
+    assert.equal(clientBody.id, "chatcmpl-3");
+    assert.equal(clientBody.choices[0].message.content, "yes");
+    assert.equal(Object.hasOwn(clientBody, "cost"), false);
   }
 });
 
@@ -432,7 +443,7 @@ test("returns inference streams immediately without reading the upstream body", 
   let streamOpen = true;
   const upstreamResponse = new Response(new ReadableStream({
     start(controller) {
-      controller.enqueue(encoder.encode("data: first\\n\\n"));
+      controller.enqueue(encoder.encode("data: {\"id\":\"c\",\"choices\":[{\"delta\":{\"content\":\"first\"},\"index\":0}]}\n\n"));
     },
     cancel() {
       streamOpen = false;
@@ -445,16 +456,18 @@ test("returns inference streams immediately without reading the upstream body", 
   const response = await withMockFetch(async () => upstreamResponse, async () => {
     return onRequest(contextFor("/v1/chat/completions", {
       method: "POST",
-      body: JSON.stringify({ model: "deepseek-v4-flash", messages: [] }),
+      body: JSON.stringify({ model: "deepseek-v4-flash", messages: [], stream: true }),
     }));
   });
 
-  assert.equal(response, upstreamResponse);
-  assert.equal(response.bodyUsed, false);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "text/event-stream");
+  assert.notEqual(response, upstreamResponse, "chat stream is rewritten for cleaning");
 
   const reader = response.body.getReader();
   const firstChunk = await reader.read();
-  assert.equal(new TextDecoder().decode(firstChunk.value), "data: first\\n\\n");
+  const text = new TextDecoder().decode(firstChunk.value);
+  assert.match(text, /data: /);
   assert.equal(firstChunk.done, false);
   assert.equal(streamOpen, true);
   await reader.cancel();
@@ -1162,4 +1175,207 @@ test("mapRequestBody skips reasoning backfill when thinking is disabled", async 
   // Only the model mapping changed; no reasoning_content was injected.
   assert.equal(payload.model, "deepseek-v4-flash-free");
   assert.equal(Object.hasOwn(payload.messages[1], "reasoning_content"), false);
+});
+
+test("chat completions injects stream_options and fills tool-call gaps", async () => {
+  let capturedInit;
+  const upstreamResponse = new Response(JSON.stringify({
+    id: "chatcmpl-gap",
+    choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop", index: 0 }],
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+
+  await withMockFetch(async (_url, init) => {
+    capturedInit = init;
+    return upstreamResponse;
+  }, async () => onRequest(contextFor("/v1/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "deepseek-v4-flash",
+      stream: true,
+      stream_options: { event_frequency: "token" },
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "call_1", type: "function", function: { name: "weather", arguments: "{}" } }],
+        },
+        { role: "user", content: "continue" },
+      ],
+    }),
+  })));
+
+  const payload = JSON.parse(capturedInit.body);
+  assert.equal(payload.stream_options.include_usage, true);
+  assert.equal(payload.stream_options.event_frequency, "token");
+  assert.equal(payload.messages.length, 4);
+  assert.equal(payload.messages[2].role, "tool");
+  assert.equal(payload.messages[2].tool_call_id, "call_1");
+});
+
+test("responses merges client stream_options and keeps include_usage", async () => {
+  let capturedInit;
+  await withMockFetch(async (_url, init) => {
+    capturedInit = init;
+    return new Response(JSON.stringify({
+      id: "chatcmpl-so",
+      created: 1,
+      choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop", index: 0 }],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }, async () => onRequest(contextFor("/v1/responses", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "deepseek-v4-flash",
+      stream: true,
+      stream_options: { event_frequency: "token" },
+      input: "hello",
+    }),
+  })));
+
+  const payload = JSON.parse(capturedInit.body);
+  assert.equal(payload.stream_options.include_usage, true);
+  assert.equal(payload.stream_options.event_frequency, "token");
+});
+
+test("responses previous_response_id replays prior tool-call context", async () => {
+  clearStoredResponses();
+  const payloads = [];
+  const responses = [
+    new Response(JSON.stringify({
+      id: "resp_prev",
+      created: 1,
+      choices: [{
+        message: {
+          tool_calls: [{
+            id: "call_patch",
+            type: "function",
+            function: { name: "apply_patch", arguments: "{\"input\":\"*** Begin Patch\\n*** End Patch\"}" },
+          }],
+        },
+        finish_reason: "tool_calls",
+        index: 0,
+      }],
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+    new Response(JSON.stringify({
+      id: "resp_next",
+      created: 2,
+      choices: [{ message: { role: "assistant", content: "done" }, finish_reason: "stop", index: 0 }],
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+  ];
+
+  await withMockFetch(async (_url, init) => {
+    payloads.push(JSON.parse(init.body));
+    return responses.shift();
+  }, async () => {
+    const first = await onRequest(contextFor("/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "deepseek-v4-flash",
+        input: "edit file",
+        tools: [{ type: "apply_patch" }],
+      }),
+    }));
+    const firstBody = await first.json();
+    assert.equal(firstBody.id, "resp_prev");
+    assert.ok(loadResponseState("resp_prev"), "first response was stored");
+
+    const second = await onRequest(contextFor("/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({
+        previous_response_id: "resp_prev",
+        input: [{
+          type: "apply_patch_call_output",
+          call_id: "call_patch",
+          output: "patch applied",
+          status: "completed",
+        }],
+      }),
+    }));
+    assert.equal(second.status, 200);
+  });
+
+  assert.equal(payloads.length, 2);
+  const secondMessages = payloads[1].messages;
+  assert.equal(secondMessages.length, 2);
+  assert.equal(secondMessages[0].role, "assistant");
+  assert.equal(secondMessages[0].tool_calls[0].function.name, "apply_patch");
+  assert.equal(secondMessages[1].role, "tool");
+  assert.equal(secondMessages[1].tool_call_id, "call_patch");
+  assert.equal(secondMessages[1].content, "patch applied");
+  // Tools inherited from previous turn when omitted
+  assert.ok(Array.isArray(payloads[1].tools));
+  assert.equal(payloads[1].tools[0].function.name, "apply_patch");
+});
+
+test("responses store:false skips persistence", async () => {
+  clearStoredResponses();
+  await withMockFetch(async () => new Response(JSON.stringify({
+    id: "resp_nostore",
+    created: 1,
+    choices: [{ message: { role: "assistant", content: "x" }, finish_reason: "stop", index: 0 }],
+  }), { status: 200, headers: { "content-type": "application/json" } }), async () => {
+    await onRequest(contextFor("/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "deepseek-v4-flash",
+        store: false,
+        input: "hello",
+      }),
+    }));
+  });
+  assert.equal(loadResponseState("resp_nostore"), null);
+});
+
+test("convertAnthropicToOpenAI maps message payloads to chat completions", () => {
+  assert.equal(isAnthropicFormat(JSON.stringify({
+    type: "message",
+    role: "assistant",
+    content: [{ type: "text", text: "hi" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 2 },
+  })), true);
+
+  const out = JSON.parse(convertAnthropicToOpenAI(JSON.stringify({
+    id: "msg_1",
+    type: "message",
+    role: "assistant",
+    content: [{ type: "text", text: "hi" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 2 },
+  }), "deepseek-v4-flash-free"));
+
+  assert.equal(out.object, "chat.completion");
+  assert.equal(out.choices[0].message.content, "hi");
+  assert.equal(out.choices[0].finish_reason, "stop");
+  assert.equal(out.usage.prompt_tokens, 1);
+  assert.equal(out.usage.completion_tokens, 2);
+  assert.equal(out.usage.total_tokens, 3);
+});
+
+test("chat completions strips cost and disabled reasoning_content", async () => {
+  let captured;
+  const response = await withMockFetch(async () => new Response(JSON.stringify({
+    id: "chatcmpl-clean",
+    choices: [{
+      message: { role: "assistant", content: "ok", reasoning_content: "secret" },
+      finish_reason: "stop",
+      index: 0,
+    }],
+    cost: 1.23,
+  }), { status: 200, headers: { "content-type": "application/json" } }), async () => onRequest(contextFor("/v1/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "deepseek-v4-flash",
+      thinking: { type: "disabled" },
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })));
+
+  captured = await response.json();
+  assert.equal(Object.hasOwn(captured, "cost"), false);
+  assert.equal(Object.hasOwn(captured.choices[0].message, "reasoning_content"), false);
+  assert.equal(captured.choices[0].message.content, "ok");
 });

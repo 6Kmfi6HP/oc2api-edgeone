@@ -245,6 +245,45 @@ function sanitizeTools(tools) {
   return anyRemoved ? result : tools;
 }
 
+// ======================== Responses previous_response_id 状态 ========================
+// Best-effort in-isolate store (mirrors upstream opencode2api). Edge isolates are
+// ephemeral and do not share memory across instances; clients that need durable
+// multi-turn state should resend full input.
+
+const storedResponses = new Map();
+
+function storeResponseState(response, req) {
+  if (req && req.store === false) {
+    return;
+  }
+  const responseID = response && typeof response.id === "string" ? response.id : "";
+  if (responseID === "") {
+    return;
+  }
+  storedResponses.set(responseID, {
+    model: typeof req.model === "string" ? req.model : "",
+    instructions: typeof req.instructions === "string" ? req.instructions : "",
+    tools: Array.isArray(req.tools) ? jsonClone(req.tools) : [],
+    tool_choice: req.tool_choice !== undefined ? jsonClone(req.tool_choice) : undefined,
+    output: Array.isArray(response.output) ? jsonClone(response.output) : [],
+  });
+}
+
+function loadResponseState(responseID) {
+  if (typeof responseID !== "string" || responseID === "") {
+    return null;
+  }
+  const state = storedResponses.get(responseID);
+  if (!state) {
+    return null;
+  }
+  return jsonClone(state);
+}
+
+function clearStoredResponses() {
+  storedResponses.clear();
+}
+
 // ======================== 清理：Chat 响应 / 流 ========================
 
 function cleanNulls(map) {
@@ -381,6 +420,233 @@ function convertResponse(data, keepReasoning) {
   }
   delete raw.cost;
   return jsonStringify(raw);
+}
+
+function chatStreamHandler(respBody, keepReasoning) {
+  const enc = new TextEncoder();
+  return new ReadableStream({
+    async start(controller) {
+      try {
+        for await (const line of sseBodyLines(respBody)) {
+          const [out] = convertStreamChunkWithUsage(line, keepReasoning);
+          if (!out) {
+            continue;
+          }
+          controller.enqueue(enc.encode(out + "\n"));
+        }
+      } catch (err) {
+        try {
+          controller.error(err);
+        } catch {
+          // already closed
+        }
+        return;
+      }
+      controller.close();
+    },
+  });
+}
+
+// ======================== Anthropic 格式兼容（Chat 非流式） ========================
+
+function isAnthropicFormat(body) {
+  if (typeof body !== "string" || body === "") {
+    return false;
+  }
+  try {
+    const obj = JSON.parse(body);
+    if (obj !== null && typeof obj === "object" && !Array.isArray(obj) && obj.type === "message") {
+      return true;
+    }
+  } catch {
+    // fall through to SSE scan
+  }
+  for (const line of body.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "") {
+      continue;
+    }
+    let event;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (event === null || typeof event !== "object" || Array.isArray(event)) {
+      continue;
+    }
+    const typ = event.type;
+    switch (typ) {
+      case "message_start":
+      case "content_block_start":
+      case "content_block_delta":
+      case "content_block_stop":
+      case "message_delta":
+      case "message_stop":
+      case "ping":
+        return true;
+      default:
+        return false;
+    }
+  }
+  return false;
+}
+
+function buildOpenAIResponseFromAnthropic(anthropicMsg, text, toolUseBlocks, modelID) {
+  if (anthropicMsg === null || typeof anthropicMsg !== "object") {
+    return null;
+  }
+  let role = typeof anthropicMsg.role === "string" && anthropicMsg.role !== ""
+    ? anthropicMsg.role
+    : "assistant";
+  const finishReason = normalizeFinishReason(
+    typeof anthropicMsg.stop_reason === "string" ? anthropicMsg.stop_reason : "stop",
+  );
+  const message = { role, content: text };
+  if (Array.isArray(toolUseBlocks) && toolUseBlocks.length > 0) {
+    message.tool_calls = toolUseBlocks.map((tb) => ({
+      id: tb.id,
+      type: "function",
+      function: {
+        name: tb.name,
+        arguments: typeof tb.input === "string" ? tb.input : (jsonStringify(tb.input) || "{}"),
+      },
+    }));
+    if (text === "") {
+      message.content = null;
+    }
+  }
+  const resp = {
+    id: anthropicMsg.id,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: modelID,
+    choices: [{ index: 0, message, finish_reason: finishReason }],
+  };
+  if (anthropicMsg.usage != null && typeof anthropicMsg.usage === "object") {
+    resp.usage = anthropicUsageToChat(anthropicMsg.usage);
+  }
+  return jsonStringify(resp);
+}
+
+function convertAnthropicMessageToOpenAI(msg, modelID) {
+  const model = msg.model || modelID;
+  let text = "";
+  const toolUses = [];
+  if (Array.isArray(msg.content)) {
+    for (const block of msg.content) {
+      if (block === null || typeof block !== "object") {
+        continue;
+      }
+      if (block.type === "text" && typeof block.text === "string") {
+        text += block.text;
+      } else if (block.type === "tool_use") {
+        toolUses.push(block);
+      }
+    }
+  }
+  return buildOpenAIResponseFromAnthropic(msg, text, toolUses, model);
+}
+
+function parseAnthropicSSEToOpenAI(body, modelID) {
+  let anthropicMsg = null;
+  let text = "";
+  let currentToolUse = null;
+  let currentToolInput = "";
+  const toolUseBlocks = [];
+
+  for (const rawLine of body.split("\n")) {
+    const line = rawLine.trim();
+    if (line === "") {
+      continue;
+    }
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event === null || typeof event !== "object") {
+      continue;
+    }
+    switch (event.type) {
+      case "message_start":
+        if (event.message != null && typeof event.message === "object") {
+          anthropicMsg = event.message;
+        }
+        break;
+      case "content_block_start":
+        if (event.content_block != null && typeof event.content_block === "object"
+          && event.content_block.type === "tool_use") {
+          currentToolUse = event.content_block;
+          currentToolInput = "";
+        }
+        break;
+      case "content_block_delta":
+        if (event.delta != null && typeof event.delta === "object") {
+          if (typeof event.delta.text === "string") {
+            text += event.delta.text;
+          }
+          if (event.delta.type === "input_json_delta" && typeof event.delta.partial_json === "string") {
+            currentToolInput += event.delta.partial_json;
+          }
+        }
+        break;
+      case "content_block_stop":
+        if (currentToolUse) {
+          let input = currentToolInput;
+          try {
+            input = JSON.parse(currentToolInput);
+          } catch {
+            // keep string
+          }
+          currentToolUse = { ...currentToolUse, input };
+          toolUseBlocks.push(currentToolUse);
+          currentToolUse = null;
+        }
+        break;
+      case "message_delta":
+        if (event.delta != null && typeof event.delta === "object") {
+          if (!anthropicMsg) {
+            anthropicMsg = {};
+          }
+          if (typeof event.delta.stop_reason === "string") {
+            anthropicMsg.stop_reason = event.delta.stop_reason;
+          }
+          if (event.usage != null && typeof event.usage === "object") {
+            anthropicMsg.usage = event.usage;
+          } else if (event.delta.usage != null && typeof event.delta.usage === "object") {
+            anthropicMsg.usage = event.delta.usage;
+          }
+        }
+        break;
+      case "error":
+        return null;
+      default:
+        break;
+    }
+  }
+
+  if (!anthropicMsg) {
+    return null;
+  }
+  if (anthropicMsg.model == null) {
+    anthropicMsg.model = modelID;
+  }
+  return buildOpenAIResponseFromAnthropic(anthropicMsg, text, toolUseBlocks, modelID);
+}
+
+function convertAnthropicToOpenAI(body, modelID) {
+  try {
+    const singleMsg = JSON.parse(body);
+    if (singleMsg !== null && typeof singleMsg === "object" && !Array.isArray(singleMsg)
+      && singleMsg.type === "message") {
+      return convertAnthropicMessageToOpenAI(singleMsg, modelID);
+    }
+  } catch {
+    // SSE path
+  }
+  return parseAnthropicSSEToOpenAI(body, modelID) || body;
 }
 
 // ======================== Thinking / Reasoning ========================
@@ -2161,6 +2427,7 @@ function responsesStreamHandler(respBody, model, wantReasoning, tools, toolChoic
           sequence_number: seq,
           response: completedResponse,
         });
+        storeResponseState(completedResponse, originalReq || {});
       };
 
       try {
@@ -2481,11 +2748,35 @@ async function handleResponses(request) {
   }
 
   const originalReq = req;
-  const model = typeof req.model === "string" && req.model !== "" ? req.model : DEFAULT_MODEL;
+  let model = typeof req.model === "string" && req.model !== "" ? req.model : "";
+  let tools = Array.isArray(req.tools) ? req.tools : [];
+  let toolChoice = req.tool_choice;
+
+  let previousState = null;
+  if (typeof req.previous_response_id === "string" && req.previous_response_id !== "") {
+    previousState = loadResponseState(req.previous_response_id);
+    if (previousState) {
+      if (!model && previousState.model) {
+        model = previousState.model;
+      }
+      if (tools.length === 0 && Array.isArray(previousState.tools) && previousState.tools.length > 0) {
+        tools = previousState.tools;
+      }
+      if (toolChoice === undefined && previousState.tool_choice !== undefined) {
+        toolChoice = previousState.tool_choice;
+      }
+    }
+  }
+  if (!model) {
+    model = DEFAULT_MODEL;
+  }
   const upstreamModel = toUpstreamModelId(model);
 
   const messages = Array.isArray(req.messages) ? req.messages.slice() : [];
   if (messages.length === 0) {
+    if (previousState && Array.isArray(previousState.output) && previousState.output.length > 0) {
+      messages.push(...responsesInputToMessages(previousState.output, ""));
+    }
     messages.push(...responsesInputToMessages(req.input, req.instructions || ""));
   } else if (req.instructions) {
     messages.unshift({ role: "system", content: req.instructions });
@@ -2498,8 +2789,8 @@ async function handleResponses(request) {
     temperature: req.temperature,
     max_tokens: req.max_output_tokens,
     top_p: req.top_p,
-    tool_choice: req.tool_choice !== undefined ? convertResponsesToolChoice(req.tool_choice) : undefined,
-    tools: !Array.isArray(req.tools) || req.tools.length === 0 ? undefined : convertResponsesTools(req.tools),
+    tool_choice: toolChoice !== undefined ? convertResponsesToolChoice(toolChoice) : undefined,
+    tools: tools.length === 0 ? undefined : convertResponsesTools(tools),
     reasoning_effort: req.reasoning != null && typeof req.reasoning === "object" && req.reasoning.effort !== "none" ? req.reasoning.effort : "",
     thinking: req.thinking,
     extra_body: {},
@@ -2520,8 +2811,16 @@ async function handleResponses(request) {
   if (typeof req.user === "string" && req.user !== "") {
     chatReq.extra_body.user = req.user;
   }
-  if (req.stream) {
-    chatReq.extra_body.stream_options = { include_usage: true };
+  if (chatReq.stream) {
+    if (req.stream_options != null && typeof req.stream_options === "object" && !Array.isArray(req.stream_options)) {
+      const streamOptions = { ...req.stream_options };
+      if (!Object.prototype.hasOwnProperty.call(streamOptions, "include_usage")) {
+        streamOptions.include_usage = true;
+      }
+      chatReq.extra_body.stream_options = streamOptions;
+    } else {
+      chatReq.extra_body.stream_options = { include_usage: true };
+    }
   }
 
   chatReq.messages = fixToolCallGaps(chatReq.messages);
@@ -2532,6 +2831,14 @@ async function handleResponses(request) {
   const init = chatRequestInit(request, bodyObj);
   const upstream = await fetch(chatUpstreamUrl(request.url), init);
 
+  const storeReq = {
+    model,
+    instructions: req.instructions,
+    tools,
+    tool_choice: toolChoice,
+    store: req.store,
+  };
+
   if (chatReq.stream) {
     if (!upstream.ok) {
       return upstream;
@@ -2541,16 +2848,16 @@ async function handleResponses(request) {
         upstream.body,
         model,
         !isThinkingDisabled(req.thinking),
-        Array.isArray(req.tools) ? req.tools : [],
-        req.tool_choice,
-        originalReq,
+        tools,
+        toolChoice,
+        { ...originalReq, ...storeReq },
       ),
     );
   }
 
   const raw = await upstream.arrayBuffer();
   const text = new TextDecoder().decode(raw);
-  let responsesBody = convertChatToResponses(text, model, keepReasoning, Array.isArray(req.tools) ? req.tools : [], req.tool_choice);
+  let responsesBody = convertChatToResponses(text, model, keepReasoning, tools, toolChoice);
   let responseMap;
   try {
     responseMap = JSON.parse(responsesBody);
@@ -2559,15 +2866,88 @@ async function handleResponses(request) {
   }
   if (responseMap) {
     applyResponsesRequestEcho(responseMap, originalReq);
-    if (Array.isArray(req.tools) && req.tools.length > 0) {
-      responseMap.tools = req.tools;
+    if (tools.length > 0) {
+      responseMap.tools = tools;
     }
-    if (req.tool_choice !== undefined) {
-      responseMap.tool_choice = req.tool_choice;
+    if (toolChoice !== undefined) {
+      responseMap.tool_choice = toolChoice;
     }
+    storeResponseState(responseMap, storeReq);
     responsesBody = jsonStringify(responseMap);
   }
   const response = new Response(responsesBody, {
+    status: upstream.status || 200,
+    statusText: upstream.statusText,
+    headers: transformResponseHeaders(upstream.headers),
+  });
+  response.headers.set("content-type", "application/json; charset=utf-8");
+  return response;
+}
+
+async function handleChatCompletions(request) {
+  const body = await readJsonObject(request);
+  if (body === null) {
+    return jsonResponseBody(400, { error: { message: "Invalid JSON" } });
+  }
+
+  if (typeof body.model === "string" && body.model.length > 0) {
+    body.model = toUpstreamModelId(body.model);
+  } else {
+    body.model = toUpstreamModelId(DEFAULT_MODEL);
+  }
+
+  const cleanedTools = sanitizeTools(body.tools);
+  if (cleanedTools !== body.tools) {
+    if (!cleanedTools || cleanedTools.length === 0) {
+      delete body.tools;
+    } else {
+      body.tools = cleanedTools;
+    }
+  }
+
+  const keepReasoning = wantsReasoning({ thinking: body.thinking, extra_body: body.extra_body });
+  if (Array.isArray(body.messages)) {
+    body.messages = fixToolCallGaps(body.messages);
+    body.messages = ensureReasoningContent(body.messages, keepReasoning);
+  }
+
+  const stream = body.stream === true;
+  if (stream) {
+    if (body.stream_options != null && typeof body.stream_options === "object" && !Array.isArray(body.stream_options)) {
+      if (!Object.prototype.hasOwnProperty.call(body.stream_options, "include_usage")) {
+        body.stream_options = { ...body.stream_options, include_usage: true };
+      }
+    } else {
+      body.stream_options = { include_usage: true };
+    }
+  }
+
+  const init = chatRequestInit(request, body);
+  const upstream = await fetch(chatUpstreamUrl(request.url), init);
+
+  if (stream) {
+    if (!upstream.ok) {
+      return upstream;
+    }
+    return sseResponse(chatStreamHandler(upstream.body, keepReasoning));
+  }
+
+  const raw = await upstream.arrayBuffer();
+  let text = new TextDecoder().decode(raw);
+  if (!upstream.ok) {
+    return new Response(text, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: transformResponseHeaders(upstream.headers),
+    });
+  }
+
+  if (isAnthropicFormat(text)) {
+    text = convertAnthropicToOpenAI(text, body.model);
+  }
+  text = convertResponse(text, keepReasoning);
+
+  const response = new Response(text, {
     status: upstream.status || 200,
     statusText: upstream.statusText,
     headers: transformResponseHeaders(upstream.headers),
@@ -2596,8 +2976,11 @@ export default async function onRequest(context) {
       return await handleResponses(request);
     }
 
-    // 透传（GET/其它路径/无法转换的推理请求；/v1/chat/completions 本就是 Chat，
-    // 无需格式转换，保持透传以支持原生流式而不过早消费上游 body）
+    if (method === "POST" && pathname === CHAT_PATH) {
+      return await handleChatCompletions(request);
+    }
+
+    // 透传（GET/其它路径；推理三条入口已各自处理）
     const response = await fetch(upstreamUrl(request.url), await requestInit(request));
     return response;
   } catch (err) {
@@ -2654,28 +3037,38 @@ async function mapRequestBody(request) {
         changed = true;
       }
 
-      // Chat requests are passed through, so they never hit ensureReasoningContent
-      // in the messages/responses handlers. Upstream rejects multi-turn histories
-      // whose assistant messages carry no reasoning_content, so backfill empty
-      // strings here (same nil-vs-empty rule), unless thinking is explicitly off.
-      if (
-        Array.isArray(payload.messages)
-        && wantsReasoning({ thinking: payload.thinking, extra_body: payload.extra_body })
-      ) {
-        let backfilled = false;
-        for (const msg of payload.messages) {
-          if (
-            msg !== null
-            && typeof msg === "object"
-            && !Array.isArray(msg)
-            && msg.role === "assistant"
-            && msg.reasoning_content == null
-          ) {
-            msg.reasoning_content = "";
-            backfilled = true;
+      // Chat requests may still go through requestInit/mapRequestBody in tests
+      // and non-handler paths. Mirror handleChatCompletions request fixes here.
+      if (Array.isArray(payload.messages)) {
+        const fixed = fixToolCallGaps(payload.messages);
+        if (JSON.stringify(fixed) !== JSON.stringify(payload.messages)) {
+          payload.messages = fixed;
+          changed = true;
+        }
+        if (wantsReasoning({ thinking: payload.thinking, extra_body: payload.extra_body })) {
+          const needsBackfill = payload.messages.some(
+            (msg) =>
+              msg !== null
+              && typeof msg === "object"
+              && !Array.isArray(msg)
+              && msg.role === "assistant"
+              && msg.reasoning_content == null,
+          );
+          if (needsBackfill) {
+            payload.messages = ensureReasoningContent(payload.messages, true);
+            changed = true;
           }
         }
-        if (backfilled) {
+      }
+
+      if (payload.stream === true) {
+        if (payload.stream_options != null && typeof payload.stream_options === "object" && !Array.isArray(payload.stream_options)) {
+          if (!Object.prototype.hasOwnProperty.call(payload.stream_options, "include_usage")) {
+            payload.stream_options = { ...payload.stream_options, include_usage: true };
+            changed = true;
+          }
+        } else {
+          payload.stream_options = { include_usage: true };
           changed = true;
         }
       }
@@ -2773,12 +3166,15 @@ export {
   buildClaudeMessageUsage,
   buildResponseToolCallItem,
   chatContentToResponsesContent,
+  chatStreamHandler,
   chatUpstreamUrl,
   cleanJsonSchema,
+  clearStoredResponses,
   claudeStreamHandler,
   claudeToOpenAIMessages,
   claudeToOpenAITools,
   collectFunctionOutputs,
+  convertAnthropicToOpenAI,
   convertChatToResponses,
   convertClaudeRequest,
   convertClaudeToolChoice,
@@ -2791,8 +3187,10 @@ export {
   filterModelsResponse,
   fixToolCallGaps,
   forwardHeaders,
+  isAnthropicFormat,
   isThinkingDisabled,
   isThinkingEnabled,
+  loadResponseState,
   mapRequestBody,
   normalizeFinishReason,
   openAIToClaudeResponse,
@@ -2807,6 +3205,7 @@ export {
   responsesToolKindMap,
   sanitizeTools,
   sseResponse,
+  storeResponseState,
   toFloat64,
   toolCallOutputType,
   toPublicModelId,
