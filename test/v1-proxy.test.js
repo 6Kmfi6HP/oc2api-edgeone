@@ -938,6 +938,105 @@ test("end-to-end Responses entry converts request and response", async () => {
   assert.ok(Array.isArray(clientBody.output));
 });
 
+test("end-to-end Claude stream preserves a trailing usage-only chunk", async () => {
+  let capturedBody;
+  const upstreamSse = [
+    "data: " + JSON.stringify({ id: "chatcmpl-mimo", choices: [{ delta: { content: "OK" }, finish_reason: null, index: 0 }] }) + "\n\n",
+    "data: " + JSON.stringify({ id: "chatcmpl-mimo", choices: [{ delta: {}, finish_reason: "stop", index: 0 }] }) + "\n\n",
+    "data: " + JSON.stringify({ id: "chatcmpl-mimo", choices: [], usage: { prompt_tokens: 11, completion_tokens: 2, total_tokens: 13 } }) + "\n\n",
+    "data: [DONE]\n\n",
+  ].join("");
+
+  const response = await withMockFetch(async (_url, init) => {
+    capturedBody = JSON.parse(init.body);
+    return new Response(upstreamSse, { headers: { "content-type": "text/event-stream" } });
+  }, async () => onRequest(contextFor("/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "mimo-v2.5",
+      max_tokens: 16,
+      stream: true,
+      messages: [{ role: "user", content: "Reply with exactly OK" }],
+    }),
+  })));
+
+  assert.deepEqual(capturedBody.stream_options, { include_usage: true });
+  const events = await collectSSEEvents(response.body);
+  const messageStart = events.find(event => event.event === "message_start");
+  const messageDelta = events.find(event => event.event === "message_delta");
+  assert.equal(messageStart.data.message.usage.input_tokens, 0);
+  assert.deepEqual(messageDelta.data.usage, { input_tokens: 11, output_tokens: 2 });
+});
+
+test("end-to-end Responses stream preserves a trailing usage-only chunk", async () => {
+  let capturedBody;
+  const upstreamSse = [
+    "data: " + JSON.stringify({ id: "chatcmpl-mimo", created: 1234567890, choices: [{ delta: { content: "OK" }, finish_reason: null, index: 0 }] }) + "\n\n",
+    "data: " + JSON.stringify({ id: "chatcmpl-mimo", choices: [{ delta: {}, finish_reason: "stop", index: 0 }] }) + "\n\n",
+    "data: " + JSON.stringify({ id: "chatcmpl-mimo", choices: [], usage: { prompt_tokens: 11, completion_tokens: 2, total_tokens: 13 } }) + "\n\n",
+    "data: [DONE]\n\n",
+  ].join("");
+
+  const response = await withMockFetch(async (_url, init) => {
+    capturedBody = JSON.parse(init.body);
+    return new Response(upstreamSse, { headers: { "content-type": "text/event-stream" } });
+  }, async () => onRequest(contextFor("/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "mimo-v2.5",
+      input: "Reply with exactly OK",
+      max_output_tokens: 16,
+      stream: true,
+    }),
+  })));
+
+  assert.deepEqual(capturedBody.stream_options, { include_usage: true });
+  const events = await collectSSEEvents(response.body);
+  const completed = events.find(event => event.event === "response.completed");
+  assert.deepEqual(completed.data.response.usage, {
+    input_tokens: 11,
+    input_tokens_details: { cached_tokens: 0 },
+    output_tokens: 2,
+    total_tokens: 13,
+  });
+});
+
+test("end-to-end Responses incomplete stream preserves trailing usage", async () => {
+  const upstreamSse = [
+    "data: " + JSON.stringify({ id: "chatcmpl-mimo", created: 1234567890, choices: [{ delta: { reasoning_content: "thinking" }, finish_reason: null, index: 0 }] }) + "\n\n",
+    "data: " + JSON.stringify({ id: "chatcmpl-mimo", choices: [{ delta: {}, finish_reason: "length", index: 0 }] }) + "\n\n",
+    "data: " + JSON.stringify({ id: "chatcmpl-mimo", choices: [], usage: { prompt_tokens: 11, completion_tokens: 16, total_tokens: 27 } }) + "\n\n",
+    "data: [DONE]\n\n",
+  ].join("");
+
+  const response = await withMockFetch(
+    async () => new Response(upstreamSse, { headers: { "content-type": "text/event-stream" } }),
+    async () => onRequest(contextFor("/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "mimo-v2.5",
+        input: "Reply with exactly OK",
+        max_output_tokens: 16,
+        stream: true,
+      }),
+    })),
+  );
+
+  const events = await collectSSEEvents(response.body);
+  const incomplete = events.find(event => event.event === "response.incomplete");
+  assert.equal(incomplete.data.response.status, "incomplete");
+  assert.equal(incomplete.data.response.incomplete_details.reason, "max_output_tokens");
+  assert.deepEqual(incomplete.data.response.usage, {
+    input_tokens: 11,
+    input_tokens_details: { cached_tokens: 0 },
+    output_tokens: 16,
+    total_tokens: 27,
+  });
+});
+
 test("end-to-end preserves -free model mapping and tool sanitization", async () => {
   let capturedUrl;
   let capturedBody;

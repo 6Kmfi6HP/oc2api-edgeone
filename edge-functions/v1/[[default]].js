@@ -1044,6 +1044,8 @@ function claudeStreamHandler(respBody, model, keepReasoning) {
       const toolCallOrder = [];
       let messageStartSent = false;
       let fullUsage = null;
+      let finalStopReason = "end_turn";
+      let finishSeen = false;
 
       const emit = (event, data) => {
         controller.enqueue(enc.encode(`event: ${event}\n`));
@@ -1203,6 +1205,10 @@ function claudeStreamHandler(respBody, model, keepReasoning) {
             || finishReason === "function_call"
             || finishReason === "content_filter"
           ) {
+            if (finishSeen) {
+              continue;
+            }
+            finishSeen = true;
             closeThinkingBlock();
             closeTextBlock();
 
@@ -1215,27 +1221,18 @@ function claudeStreamHandler(respBody, model, keepReasoning) {
               });
             }
 
-            let stopReason = "end_turn";
             switch (finishReason) {
               case "length":
-                stopReason = "max_tokens";
+                finalStopReason = "max_tokens";
                 break;
               case "tool_calls":
               case "function_call":
-                stopReason = "tool_use";
+                finalStopReason = "tool_use";
                 break;
               case "content_filter":
-                stopReason = "refusal";
+                finalStopReason = "refusal";
                 break;
             }
-
-            emit("message_delta", {
-              type: "message_delta",
-              delta: { stop_reason: stopReason },
-              usage: buildClaudeDeltaUsage(fullUsage),
-            });
-            emit("message_stop", { type: "message_stop" });
-            return;
           }
         }
 
@@ -1243,8 +1240,8 @@ function claudeStreamHandler(respBody, model, keepReasoning) {
         closeTextBlock();
         emit("message_delta", {
           type: "message_delta",
-          delta: { stop_reason: "end_turn" },
-          usage: buildClaudeDeltaUsage(null),
+          delta: { stop_reason: finalStopReason },
+          usage: buildClaudeDeltaUsage(fullUsage),
         });
         emit("message_stop", { type: "message_stop" });
       } finally {
@@ -2190,6 +2187,10 @@ function responsesStreamHandler(respBody, model, wantReasoning, tools, toolChoic
             createdSent = true;
           }
 
+          if (chunk.usage != null && typeof chunk.usage === "object") {
+            totalUsage = chunk.usage;
+          }
+
           const choices = chunk.choices;
           if (!Array.isArray(choices) || choices.length === 0) {
             continue;
@@ -2328,10 +2329,6 @@ function responsesStreamHandler(respBody, model, wantReasoning, tools, toolChoic
                 });
               }
             }
-          }
-
-          if (chunk.usage != null && typeof chunk.usage === "object") {
-            totalUsage = chunk.usage;
           }
 
           if (finishReason === "stop" || finishReason === "length" || finishReason === "content_filter") {
