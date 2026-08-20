@@ -31,6 +31,7 @@ import onRequest, {
   isAnthropicFormat,
   isThinkingDisabled,
   isThinkingEnabled,
+  isZenPrefixedPath,
   loadResponseState,
   mapRequestBody,
   normalizeFinishReason,
@@ -122,6 +123,183 @@ test("maps supported Zen paths and query strings without duplicating /v1", async
       `https://opencode.ai/zen${path}?stream=true`,
     );
   }
+});
+
+// ==================== /zen/v1 原样透传 ====================
+
+test("isZenPrefixedPath only matches an actual /zen prefix", () => {
+  assert.equal(isZenPrefixedPath("/zen"), true);
+  assert.equal(isZenPrefixedPath("/zen/v1/models"), true);
+  assert.equal(isZenPrefixedPath("/zen/v1/chat/completions"), true);
+  assert.equal(isZenPrefixedPath("/v1/models"), false);
+  assert.equal(isZenPrefixedPath("/zenith/foo"), false);
+});
+
+test("upstreamUrl relays already-prefixed /zen paths without duplication", () => {
+  assert.equal(
+    upstreamUrl("https://proxy.example/zen/v1/models?stream=true"),
+    "https://opencode.ai/zen/v1/models?stream=true",
+  );
+  assert.equal(
+    upstreamUrl("https://proxy.example/zen/v1/chat/completions"),
+    "https://opencode.ai/zen/v1/chat/completions",
+  );
+  assert.equal(upstreamUrl("https://proxy.example/zen"), "https://opencode.ai/zen");
+});
+
+test("/zen/v1 chat requests pass through verbatim: URL, body, auth, response", async () => {
+  const requestBody = {
+    model: "deepseek-v4-flash-free",
+    messages: [{ role: "user", content: "hello" }],
+    // A nameless function tool that /v1 would strip; /zen/v1 must not.
+    tools: [{ type: "function", function: {} }],
+  };
+  const upstreamBody = JSON.stringify({
+    id: "chatcmpl-zen",
+    object: "chat.completion",
+    model: "deepseek-v4-flash-free",
+    choices: [{ message: { role: "assistant", content: "hi" }, finish_reason: "stop", index: 0 }],
+  });
+
+  let capturedUrl;
+  let capturedInit;
+  const response = await withMockFetch(async (url, init) => {
+    capturedUrl = url;
+    capturedInit = init;
+    return new Response(upstreamBody, {
+      status: 200,
+      headers: { "content-type": "application/json", "x-upstream": "kept" },
+    });
+  }, async () => onRequest(contextFor("/zen/v1/chat/completions?raw=1", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer client",
+      "x-api-key": "client-value",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(requestBody),
+  })));
+
+  assert.equal(capturedUrl, "https://opencode.ai/zen/v1/chat/completions?raw=1");
+  assert.equal(capturedInit.headers.get("authorization"), PUBLIC_AUTHORIZATION);
+  assert.equal(capturedInit.headers.has("x-api-key"), false);
+  // The raw upstream model ID and the nameless tool are forwarded untouched.
+  assert.deepEqual(JSON.parse(await new Response(capturedInit.body).text()), requestBody);
+
+  assert.equal(await response.text(), upstreamBody);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-upstream"), "kept");
+});
+
+test("/zen/v1/messages is relayed as-is and is not converted to Chat", async () => {
+  const requestBody = {
+    model: "deepseek-v4-flash-free",
+    max_tokens: 64,
+    stream: false,
+    messages: [{ role: "user", content: "hello" }],
+  };
+  const upstreamBody = JSON.stringify({
+    type: "message",
+    role: "assistant",
+    content: [{ type: "text", text: "hi" }],
+  });
+
+  let capturedUrl;
+  let capturedInit;
+  const response = await withMockFetch(async (url, init) => {
+    capturedUrl = url;
+    capturedInit = init;
+    return new Response(upstreamBody, {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }, async () => onRequest(contextFor("/zen/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(requestBody),
+  })));
+
+  assert.equal(capturedUrl, "https://opencode.ai/zen/v1/messages");
+  assert.deepEqual(JSON.parse(await new Response(capturedInit.body).text()), requestBody);
+  assert.equal(await response.text(), upstreamBody);
+});
+
+test("/zen/v1/models returns the raw upstream list without free-model filtering", async () => {
+  const upstreamBody = JSON.stringify({
+    object: "list",
+    data: [
+      { id: "deepseek-v4-flash-free", object: "model" },
+      { id: "gpt-5.6-sol", object: "model" },
+    ],
+  });
+
+  let capturedUrl;
+  const response = await withMockFetch(async (url) => {
+    capturedUrl = url;
+    return new Response(upstreamBody, {
+      status: 200,
+      headers: { "content-type": "application/json", "x-raw": "1" },
+    });
+  }, async () => onRequest(contextFor("/zen/v1/models")));
+
+  assert.equal(capturedUrl, "https://opencode.ai/zen/v1/models");
+  // Unlike GET /v1/models, the pass-through keeps non-free models and the
+  // -free suffix, and preserves upstream headers verbatim.
+  assert.deepEqual(await response.json(), {
+    object: "list",
+    data: [
+      { id: "deepseek-v4-flash-free", object: "model" },
+      { id: "gpt-5.6-sol", object: "model" },
+    ],
+  });
+  assert.equal(response.headers.get("x-raw"), "1");
+});
+
+test("/zen/v1 never appends the -free suffix to a client model", async () => {
+  let capturedInit;
+  await withMockFetch(async (_url, init) => {
+    capturedInit = init;
+    return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+  }, async () => onRequest(contextFor("/zen/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-v4-flash", messages: [{ role: "user", content: "hi" }] }),
+  })));
+
+  // A non -free ID is forwarded unmapped: /zen/v1 does not add the suffix.
+  const forwarded = JSON.parse(await new Response(capturedInit.body).text());
+  assert.equal(forwarded.model, "deepseek-v4-flash");
+});
+
+test("/zen/v1 streams pass through unchanged", async () => {
+  const sseBody = 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n';
+  const response = await withMockFetch(async () => new Response(sseBody, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  }), async () => onRequest(contextFor("/zen/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-v4-flash-free", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  })));
+
+  assert.equal(response.headers.get("content-type"), "text/event-stream");
+  assert.equal(await response.text(), sseBody);
+});
+
+test("/zen/v1 error responses pass through with the upstream status", async () => {
+  const upstreamBody = JSON.stringify({ error: { message: "nope" } });
+  const response = await withMockFetch(async () => new Response(upstreamBody, {
+    status: 429,
+    headers: { "content-type": "application/json", "retry-after": "5" },
+  }), async () => onRequest(contextFor("/zen/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-v4-flash", messages: [{ role: "user", content: "x" }] }),
+  })));
+
+  assert.equal(response.status, 429);
+  assert.equal(response.headers.get("retry-after"), "5");
+  assert.deepEqual(await response.json(), { error: { message: "nope" } });
 });
 
 test("exposes only free models and strips the -free suffix", async () => {
