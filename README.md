@@ -72,8 +72,15 @@ curl https://oc2api-edgeone.edgeone.dev/v1/chat/completions \
 | `/v1/responses` | `/zen/v1/responses` |
 | `/v1/chat/completions` | `/zen/v1/chat/completions` |
 | `/v1/messages` | `/zen/v1/messages` |
+| `/zen/v1/*` | `/zen/v1/*`（原样透传） |
 
 查询参数、端到端请求头和上游状态码会保留。逐跳头、`Host`、`Content-Length` 和客户端鉴权头会被移除，由运行时重新生成必要字段。
+
+### `/zen/v1/*` 原样透传
+
+除上述四条会做协议转换的路由外，网关注册了 `/zen/v1/*` 路由，把请求**原样转发**到上游 OpenCode Zen 的同一路径：请求体、查询参数与响应（含状态码、响应头、SSE 流）都不做改写——不过滤免费模型、不追加 `-free` 后缀、不进行协议转换，也没有 `reasoning_content` 兜底。客户端需按上游原生协议调用（模型 ID 需自行使用 `-free` 后缀）。鉴权头处理与其它路由一致：客户端传入的 `Authorization` / `x-api-key` 被移除，统一注入 `Bearer public`。
+
+注：上游在推理层对 `Bearer public` 强制模型门槛——付费模型（如 `claude-opus-5`、`gpt-5.6-sol`）会返回 `401 AuthError`，只有免费模型可被调用。因此即使透传原样转发 `model`，也无法借 public 令牌消耗付费额度（模型列表可见 ≠ 可调用）。
 
 ## 本地开发
 
@@ -100,6 +107,8 @@ EdgeOne CLI 默认监听 `http://localhost:8088`。本地调试环境不能通�
 npm exec -- edgeone makers deploy -a overseas -e production
 ```
 
+新增或变更 `edge-functions/` 下的路由文件后，部署前需刷新平台级路由文件：`npx edgeone makers generate-routes`（注意：该命令在 `routes.json` 已存在时会跳过重新生成，需先删除 `.edgeone/routes.json` 再执行）。否则新路径（如 `/zen/v1/*`）虽然进了边端函数包，却不会触发，请求会落到默认静态页。
+
 项目锁定使用 `edgeone@1.6.19`，仓库不包含账号 Token、`.env` 或本地 `.edgeone` 项目绑定。
 
 ## 运行时限制
@@ -115,8 +124,9 @@ npm exec -- edgeone makers deploy -a overseas -e production
 ## 项目结构
 
 ```text
-edge-functions/v1/[[default]].js  EdgeOne 路由与代理实现
-test/v1-proxy.test.js             Node.js 单元测试
+edge-functions/v1/[[default]].js       EdgeOne 路由与代理实现
+edge-functions/zen/v1/[[default]].js   /zen/v1/* 原样透传路由（委托给主实现）
+test/v1-proxy.test.js                  Node.js 单元测试
 ```
 
 ## License

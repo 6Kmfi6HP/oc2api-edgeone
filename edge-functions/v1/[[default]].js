@@ -153,9 +153,23 @@ function sseResponse(stream) {
 
 // ======================== 模型 ID / 转发（原有） ========================
 
+/**
+ * True when the request path already carries the upstream `/zen` prefix, so a
+ * pass-through request (`/zen/v1/...`) must not have the prefix appended twice.
+ */
+function isZenPrefixedPath(pathname) {
+  return (
+    pathname === UPSTREAM_PREFIX
+    || pathname.startsWith(`${UPSTREAM_PREFIX}/`)
+  );
+}
+
 function upstreamUrl(requestUrl) {
   const incomingUrl = new URL(requestUrl);
-  return `${UPSTREAM_ORIGIN}${UPSTREAM_PREFIX}${incomingUrl.pathname}${incomingUrl.search}`;
+  const pathname = isZenPrefixedPath(incomingUrl.pathname)
+    ? incomingUrl.pathname
+    : `${UPSTREAM_PREFIX}${incomingUrl.pathname}`;
+  return `${UPSTREAM_ORIGIN}${pathname}${incomingUrl.search}`;
 }
 
 function chatUpstreamUrl(requestUrl) {
@@ -3268,6 +3282,7 @@ export {
   isAnthropicFormat,
   isThinkingDisabled,
   isThinkingEnabled,
+  isZenPrefixedPath,
   loadResponseState,
   mapRequestBody,
   normalizeFinishReason,
